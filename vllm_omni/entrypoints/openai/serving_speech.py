@@ -1261,6 +1261,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             },
         }
 
+    def _build_omnivoice_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build OmniVoice diffusion prompt from the speech request."""
+        mm_processor_kwargs: dict[str, Any] = {}
+
+        if request.instructions:
+            mm_processor_kwargs["instruct"] = request.instructions
+        if request.language:
+            mm_processor_kwargs["lang"] = request.language
+        if request.ref_text:
+            mm_processor_kwargs["ref_text"] = request.ref_text
+
+        prompt: dict[str, Any] = {"prompt": request.input}
+        if mm_processor_kwargs:
+            prompt["mm_processor_kwargs"] = mm_processor_kwargs
+        return prompt
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -1282,7 +1298,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
         elif self._tts_model_type == "omnivoice":
             tts_params = {}
-            prompt = request.input  # Diffusion engine takes raw text
+            prompt = self._build_omnivoice_prompt(request)
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -1418,12 +1434,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             request_id = f"speech-{random_uuid()}"
-            prompt = request.input
+            prompt = self._build_omnivoice_prompt(request)
 
             logger.info(
                 "Diffusion TTS speech request %s: text=%r",
                 request_id,
-                prompt[:50] + "..." if len(prompt) > 50 else prompt,
+                request.input[:50] + "..." if len(request.input) > 50 else request.input,
             )
 
             generator = self._diffusion_engine.generate(

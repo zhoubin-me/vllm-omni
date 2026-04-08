@@ -103,8 +103,10 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         """
         # Extract text from request
         prompt = req.prompts[0] if req.prompts else ""
+        mm_processor_kwargs: dict[str, object] = {}
         if isinstance(prompt, dict):
-            text = prompt.get("input", prompt.get("text", str(prompt)))
+            text = prompt.get("input", prompt.get("text", prompt.get("prompt", str(prompt))))
+            mm_processor_kwargs = prompt.get("mm_processor_kwargs") or {}
         else:
             text = str(prompt)
 
@@ -120,7 +122,14 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         target_len = max(1, int(target_len))
 
         # Tokenize with control tokens
-        style = "<|denoise|><|lang_start|>None<|lang_end|><|instruct_start|>None<|instruct_end|>"
+        lang = mm_processor_kwargs.get("lang", mm_processor_kwargs.get("language"))
+        instruct = mm_processor_kwargs.get("instruct", mm_processor_kwargs.get("instructions"))
+        lang_str = str(lang).strip() if lang is not None and str(lang).strip() else "None"
+        instruct_str = str(instruct).strip() if instruct is not None and str(instruct).strip() else "None"
+        style = (
+            f"<|denoise|><|lang_start|>{lang_str}<|lang_end|>"
+            f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+        )
         full_prompt = f"{style}<|text_start|>{text}<|text_end|>"
         encoding = self.tokenizer.encode(full_prompt)
         text_tokens = torch.tensor(encoding.ids, dtype=torch.long, device=device)

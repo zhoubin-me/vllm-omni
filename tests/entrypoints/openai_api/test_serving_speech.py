@@ -31,6 +31,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
 )
+from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import OmniVoicePipeline
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -1985,3 +1986,211 @@ class TestCosyVoice3Serving:
         assert generator == "generator"
         assert tts_params == {}
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
+
+
+class TestTTSAsyncOffloading:
+    """Tests for event-loop-safe offloading of blocking TTS operations."""
+
+    def test_build_voxtral_prompt_is_sync(self):
+        """_build_voxtral_prompt should be a regular function, not a coroutine."""
+        assert not asyncio.iscoroutinefunction(OmniOpenAIServingSpeech._build_voxtral_prompt)
+
+    @pytest.fixture
+    def voxtral_server(self, mocker: MockerFixture):
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(model="mistralai/Voxtral")
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="audio_generation"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        yield server
+        server.shutdown()
+
+    @pytest.fixture
+    def qwen3_tts_server(self, mocker: MockerFixture):
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(model="Qwen/Qwen3-TTS", hf_config=mocker.MagicMock())
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="qwen3_tts"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        yield server
+        server.shutdown()
+
+    def test_prepare_speech_generation_awaits_voxtral_async(self, voxtral_server):
+        """Voxtral path in _prepare_speech_generation should call the async wrapper."""
+        voxtral_server._build_voxtral_prompt_async = AsyncMock(
+            return_value={
+                "prompt_token_ids": [1, 2, 3],
+                "additional_information": {"voice": ["test"]},
+            }
+        )
+        request = OpenAICreateSpeechRequest(input="hello", voice="test")
+        asyncio.run(voxtral_server._prepare_speech_generation(request))
+        voxtral_server._build_voxtral_prompt_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_awaits_qwen3_tts_async(self, qwen3_tts_server):
+        """Qwen3 TTS path should call _estimate_prompt_len_async."""
+        qwen3_tts_server._validate_tts_request = MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(input="hello")
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+        qwen3_tts_server._build_tts_params.assert_called_once()
+        qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_shutdown_is_idempotent(self, mocker: MockerFixture):
+        """Calling shutdown() twice should not raise."""
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_supported_speakers", return_value=set())
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_configs = []
+        mock_engine_client.tts_max_instructions_length = None
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        assert server._tts_executor is not None
+        server.shutdown()
+        assert server._tts_executor is None
+        server.shutdown()  # Should not raise
+        assert server._tts_executor is None
+
+    def test_diffusion_instance_shutdown_safe(self):
+        """Diffusion instances (created via for_diffusion) should have safe shutdown."""
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=MagicMock(), model_name="test-model")
+        assert server._tts_executor is None
+        server.shutdown()  # Should not raise
+
+    def test_build_omnivoice_prompt_includes_instructions(self):
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=MagicMock(), model_name="k2-fsa/OmniVoice")
+        request = OpenAICreateSpeechRequest(
+            input="Hello, this is a test.",
+            instructions="female, low pitch, british accent",
+            language="English",
+        )
+
+        prompt = server._build_omnivoice_prompt(request)
+
+        assert prompt["prompt"] == request.input
+        assert prompt["mm_processor_kwargs"] == {
+            "instruct": "female, low pitch, british accent",
+            "lang": "English",
+        }
+
+    def test_create_speech_diffusion_omnivoice_preserves_instructions(self):
+        async def mock_generate_fn(*args, **kwargs):
+            yield create_mock_audio_output_for_test(request_id=kwargs.get("request_id"))
+
+        diffusion_engine = MagicMock()
+        diffusion_engine.generate = MagicMock(side_effect=mock_generate_fn)
+        diffusion_engine.default_sampling_params_list = [{}]
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=diffusion_engine,
+            model_name="k2-fsa/OmniVoice",
+        )
+        server.create_audio = MagicMock(return_value=SimpleNamespace(audio_data=b"wav", media_type="audio/wav"))
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello, this is a test.",
+            instructions="female, low pitch, british accent",
+            language="English",
+        )
+        response = asyncio.run(server.create_speech(request))
+
+        assert response.status_code == 200
+        diffusion_engine.generate.assert_called_once()
+        assert diffusion_engine.generate.call_args.kwargs["prompt"] == {
+            "prompt": "Hello, this is a test.",
+            "mm_processor_kwargs": {
+                "instruct": "female, low pitch, british accent",
+                "lang": "English",
+            },
+        }
+
+    def test_omnivoice_pipeline_applies_instruction_tokens(self):
+        class FakeTokenizer:
+            def __init__(self):
+                self.seen_prompt = None
+
+            def encode(self, text):
+                self.seen_prompt = text
+                return SimpleNamespace(ids=[1, 2, 3])
+
+        class FakeGenerator:
+            def __call__(self, **kwargs):
+                return torch.zeros((1, 8, 4), dtype=torch.long)
+
+        class FakeDecoder:
+            def __call__(self, tokens):
+                return torch.zeros((1, 1, 16), dtype=torch.float32)
+
+        pipeline = OmniVoicePipeline.__new__(OmniVoicePipeline)
+        torch.nn.Module.__init__(pipeline)
+        pipeline.device = torch.device("cpu")
+        pipeline.config = SimpleNamespace(num_audio_codebook=8, audio_mask_id=1024, sample_rate=24000)
+        pipeline.duration_estimator = MagicMock()
+        pipeline.duration_estimator.estimate_duration.return_value = 4
+        pipeline.tokenizer = FakeTokenizer()
+        pipeline.generator = FakeGenerator()
+        pipeline.decoder = FakeDecoder()
+        pipeline.num_step = 1
+        pipeline.guidance_scale = 1.0
+        pipeline.t_shift = 1.0
+        pipeline.layer_penalty_factor = 1.0
+        pipeline.position_temperature = 1.0
+        pipeline.class_temperature = 1.0
+
+        req = SimpleNamespace(
+            prompts=[
+                {
+                    "prompt": "Hello, this is a test.",
+                    "mm_processor_kwargs": {
+                        "instruct": "female, low pitch, british accent",
+                        "lang": "English",
+                    },
+                }
+            ]
+        )
+
+        pipeline.forward(req)
+
+        assert "<|lang_start|>English<|lang_end|>" in pipeline.tokenizer.seen_prompt
+        assert "<|instruct_start|>female, low pitch, british accent<|instruct_end|>" in pipeline.tokenizer.seen_prompt
